@@ -63,45 +63,52 @@ Those packages are old — `google/cloud-vision` 1.0.0, `grpc/grpc` 1.27.0,
 `guzzlehttp/guzzle` 6.5.3 — and have not been refreshed since the plugin was
 written. Updating them is a separate exercise with real regression risk.
 
+## Fixed in `fix/upload-resilience`
+
+- **Uploads no longer fatal when Vision is unavailable.** `new
+  ImageAnnotatorClient()` throws when the credential is missing, unreadable or
+  expired, and `annotateImage()` throws on quota, permission and network
+  errors. Neither was caught, so any of those took down the upload request.
+  Both are now wrapped in `try`/`catch ( \Throwable )` — `Throwable`, not
+  `Exception`, because the gRPC and protobuf layers raise `Error` subclasses —
+  the failure is logged, and an empty result is returned so the attachment is
+  still created, just untagged. The client is closed in a `finally`.
+  Reproduced before the fix: a throwing constructor propagated out of
+  `bv_update_imagetags()` as a fatal.
+- **Non-image uploads no longer warn or make a billable API call.**
+  `wp_generate_attachment_metadata` fires for every attachment;
+  `wp_get_attachment_image_src()` returns `false` for a PDF or video, so `[0]`
+  on it was `Trying to access array offset on false` and `false` was then sent
+  to Vision. Confirmed before the fix: one billable call per PDF. Now guarded
+  with `wp_attachment_is_image()` plus an `is_array()` check on the result.
+- **Removed `txt_domain_delete_fullsize_image()`.** It called
+  `unlink( wp_get_original_image_path( $media_id ) )` with no existence check,
+  no capability check and no way back. Its `add_filter` was commented out, so
+  it never ran — but it sat one uncommented line away from permanently
+  deleting every original upload. Removed rather than guarded: nothing in the
+  install referenced it, and a disk-space problem should be solved with a
+  deliberate, reversible media cleanup, not a filter on every upload.
+- `require` → `require_once` for both includes; the manual
+  `ImageAnnotatorClient.php` include was a duplicate-class fatal waiting on
+  the autoloader resolving the class first.
+- Added `defined( 'ABSPATH' ) || exit;`, and `$GLOBALS['BAD_TAGS']` is now
+  read through `isset()` + `is_array()`.
+
 ## Known issues
 
-Recorded, not fixed — this initial commit is a faithful import of what is
-deployed.
-
-- **`txt_domain_delete_fullsize_image()` permanently deletes original
-  uploads.** `index.php:148-155` calls
-  `unlink( wp_get_original_image_path( $media_id ) )` with no existence check,
-  no capability check and no way back. The `add_filter` that would run it is
-  commented out (`index.php:147`), so it is dormant — but it is one
-  uncommented line away from destroying every original image on upload, and
-  `unlink()` on a missing path also warns. A landmine, not a live bug.
-- **Non-image uploads warn, then make a billable API call.**
-  `wp_generate_attachment_metadata` fires for every attachment.
-  `wp_get_attachment_image_src()` returns `false` for a PDF or video, so
-  `[0]` on it is "Trying to access array offset on value of type bool" on
-  PHP 8, and `false` is then handed to Vision.
-- **No error handling around the API.** `new ImageAnnotatorClient()` throws if
-  credentials are missing, unreadable or expired, and `annotateImage()` throws
-  on quota, network or permission errors. Nothing catches either, so a Google
-  outage or an expired key turns **every upload into a fatal**. This is the
-  single highest-impact defect here.
-- **Every upload blocks on a synchronous three-feature API call**, billed per
-  feature per image. There is no caching, no batching, no opt-out per mime
-  type, and no way to reprocess without re-uploading.
-- **`require` rather than `require_once`** at `index.php:15` for
-  `ImageAnnotatorClient.php`, with a comment saying Composer autoload "does
-  not work". If the autoloader has already resolved the class, this is a
-  duplicate-class fatal. It is safe today only because autoloading is lazy and
-  nothing touches the class before line 15.
-- **No `defined( 'ABSPATH' ) || exit;` guard** on `index.php`.
-- **`$BAD_TAGS` is a bare file-scope global** read back through
-  `$GLOBALS['BAD_TAGS']` (`index.php:105`), with the `global` declaration
-  commented out above it. It works, but it is the same unguarded-global
-  pattern as `$special_categories` in `bv_geotagged_media`.
+- **Every upload still blocks on a synchronous three-feature API call**,
+  billed per feature per image. There is no caching, no batching, no per-mime
+  opt-out and no way to reprocess without re-uploading. Making this
+  asynchronous is a design change, not a fix.
 - **Thresholds are hardcoded** — 0.95 for labels, 0.8 for landmarks, 0.9 for
   NSFW — with no filter or setting.
-- `index.php:149` is a single ~300-column line of whitespace-padded code, the
-  same mangled-paste pathology seen in the other `bv_*` plugins.
+- **`$BAD_TAGS` is a bare file-scope global**, the same unguarded-global
+  pattern as `$special_categories` in `bv_geotagged_media`.
+- **The vendored dependencies are years out of date** — `google/cloud-vision`
+  1.0.0, `grpc/grpc` 1.27.0, `guzzlehttp/guzzle` 6.5.3. Updating them is a
+  separate exercise with real regression risk.
+- `index.php` still contains one ~300-column whitespace-padded line, the same
+  mangled-paste pathology as the other `bv_*` plugins.
 
 ## License
 

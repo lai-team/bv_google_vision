@@ -3,16 +3,24 @@
  * Plugin Name: BV Google Vision
  * Description: for image tagging and NSFW check
  * Author: Lai Consulting Team
- * Version: 0.2
- * GitLab Plugin URI: https://gitlab.com/beauvoyage/bv_google_vision
+ * Version: 0.3
+ * License: GPL-2.0-or-later
+ * GitHub Plugin URI: https://github.com/lai-team/bv_google_vision
+ *
+ * @package BV_Google_Vision
  */
 
-# includes the autoloader for libraries installed with composer
-require __DIR__ . '/vendor/autoload.php';
+defined( 'ABSPATH' ) || exit;
 
-# Composer autoload does not work. Hence the manual loading
+# includes the autoloader for libraries installed with composer
+require_once __DIR__ . '/vendor/autoload.php';
+
+# Composer autoload does not work. Hence the manual loading.
+# require_once, not require: if the autoloader has already resolved the class
+# this is otherwise a duplicate-class fatal. It was safe only because
+# autoloading is lazy and nothing touched the class before this line.
 //require __DIR__ . '/vendor/google/auth/autoload.php';
-require __DIR__ . '/vendor/google/cloud-vision/src/V1/ImageAnnotatorClient.php';
+require_once __DIR__ . '/vendor/google/cloud-vision/src/V1/ImageAnnotatorClient.php';
 
 # imports the Google Cloud client library
 use Google\Cloud\Vision\V1\ImageAnnotatorClient;
@@ -54,12 +62,31 @@ function google_detect_label($image)
 	//print_r($features);
 	//error_log(print_r('google label: '. $image,true));
 	# instantiates a client
-	$imageAnnotator = new ImageAnnotatorClient();
+	#
+	# Both the constructor and annotateImage() throw: the constructor when the
+	# credential named by GOOGLE_APPLICATION_CREDENTIALS is missing, unreadable
+	# or expired, annotateImage() on quota, permission and network errors.
+	# Neither was caught, so any of those turned every upload into a fatal.
+	# Catch Throwable rather than Exception -- the gRPC and protobuf layers
+	# raise Error subclasses too.
+	$imageAnnotator = null;
 
-	# annotate the image
-	//$image = file_get_contents($path);
-	$response = $imageAnnotator->annotateImage($image,$features);
-	$imageAnnotator->close();
+	try {
+		$imageAnnotator = new ImageAnnotatorClient();
+		$response       = $imageAnnotator->annotateImage( $image, $features );
+	} catch ( \Throwable $e ) {
+		error_log( 'bv_google_vision: Vision API call failed: ' . $e->getMessage() );
+		return array( 'NSFW' => array(), 'Labels' => array(), 'Landmarks' => array(), 'Locations' => array() );
+	} finally {
+		if ( $imageAnnotator ) {
+			try {
+				$imageAnnotator->close();
+			} catch ( \Throwable $e ) {
+				// Closing a client that never connected is not worth failing over.
+				error_log( 'bv_google_vision: closing Vision client failed: ' . $e->getMessage() );
+			}
+		}
+	}
 
 	$landmarks = $response->getLandmarkAnnotations();
 	$labels = $response->getLabelAnnotations();
@@ -102,10 +129,24 @@ function google_detect_label($image)
 
 add_filter('wp_generate_attachment_metadata', 'bv_update_imagetags',10,3);
 function bv_update_imagetags($metadata,$media_id,$context) {
-	$badtags=$GLOBALS['BAD_TAGS'];
-	$url=wp_get_attachment_image_src($media_id, 'large')[0];
-	$tarray=google_detect_label($url);
-	$TagArr=array();
+	// wp_generate_attachment_metadata fires for every attachment, not just
+	// images. wp_get_attachment_image_src() returns false for a PDF or a
+	// video, so [0] on it warned on PHP 8 and then sent false to Vision --
+	// a billable API call per non-image upload.
+	if ( ! wp_attachment_is_image( $media_id ) ) {
+		return $metadata;
+	}
+
+	$src = wp_get_attachment_image_src( $media_id, 'large' );
+
+	if ( ! is_array( $src ) || empty( $src[0] ) ) {
+		return $metadata;
+	}
+
+	$badtags = isset( $GLOBALS['BAD_TAGS'] ) && is_array( $GLOBALS['BAD_TAGS'] ) ? $GLOBALS['BAD_TAGS'] : array();
+	$url     = $src[0];
+	$tarray  = google_detect_label( $url );
+	$TagArr  = array();
 
 	#add_post_meta( $media_id, 'nsfw',max($tarray['NSFW'] ));     
 	if( !empty(array_filter($tarray['NSFW'],function($score){return $score >0.9;}))) $TagArr+=['NSFW'=>1];
@@ -144,12 +185,15 @@ function bv_update_imagetags($metadata,$media_id,$context) {
 	return $metadata;
 }
 
-//add_filter('wp_generate_attachment_metadata', 'txt_domain_delete_fullsize_image',100,3);
-function txt_domain_delete_fullsize_image($metadata,$media_id,$context)
-{                                                                                                                                                                                                               error_log(print_r('metadata '.json_encode($metadata),true));                                                                                                                                            $upload_dir = wp_upload_dir();                                                                                                                                                                          //$full_image_path = trailingslashit($upload_dir['basedir']) . $metadata['file'];                                                                                                                       //$full_image_path = trailingslashit($upload_dir['path']) . $metadata['original_image'];                                                                                                                $full_image_path = wp_get_original_image_path( $media_id );
-        error_log(print_r('to delete '.$full_image_path,true));
-        $deleted = unlink($full_image_path);
-        error_log(print_r('delete? '.$deleted,true));
-
-        return $metadata;
-}
+/*
+ * txt_domain_delete_fullsize_image() lived here. It called
+ * unlink( wp_get_original_image_path( $media_id ) ) with no existence check,
+ * no capability check and no way back, deleting the user's original upload
+ * permanently. Its add_filter was commented out, so it never ran -- but it
+ * sat one uncommented line away from destroying every original image on
+ * upload, and unlink() on a missing path warns as well.
+ *
+ * Removed rather than guarded: nothing in the install referenced it, and
+ * whatever disk-space problem it was written for should be solved with a
+ * deliberate, reversible media cleanup, not a filter on every upload.
+ */
